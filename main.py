@@ -1,224 +1,170 @@
 import os
+import telebot as tb
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    Updater,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    CallbackContext,
-)
-from faster_whisper import WhisperModel
-import ctranslate2
-import sentencepiece as spm
+import requests
+import time
+import re
 
-# Пути к моделям
-ct_model_path = "models/NLLB/nllb-200-distilled-600M-int8"
-sp_model_path = "models/NLLB/flores200_sacrebleu_tokenizer_spm.model"
 
-# Инициализация моделей
-model_dir = "models/whisper_medium"
-whisper_model = WhisperModel(model_dir)
-translator = ctranslate2.Translator(ct_model_path)
-
-# Загрузка переменных окружения из файла .env
+# Загрузка переменных окружения
 load_dotenv()
 
-# Инициализация SentencePiece
-sp = spm.SentencePieceProcessor()
-sp.load(sp_model_path)
+# Получение секретного ключа
+secret_key = os.getenv("MY_SECRET_KEY")
 
-# Клавиатура с вариантами задач
-task_keyboard = [["Транскрибация", "Перевод"]]
+# Создание экземпляра бота
+bot = tb.TeleBot(os.getenv("BOT_TOKEN"))
 
 
 # Обработчик команды /start
-def start(update: Update, context: CallbackContext) -> None:
-    """
-    Обрабатывает команду /start. Отправляет приветственное сообщение и предлагает выбрать задачу.
-    """
-    update.message.reply_text(
-        "Привет! Отправь мне аудиофайл и выбери, что мне с ним сделать.",
-        reply_markup=ReplyKeyboardMarkup(task_keyboard, one_time_keyboard=True),
-    )
+@bot.message_handler(commands=['start'])
+def start_message(message):
+    # Приветственное сообщение
+    bot.send_message(message.chat.id, 'Welcome.')
 
 
-# Обработчик аудиосообщений
-def audio_handler(update: Update, context: CallbackContext) -> None:
-    """
-    Обрабатывает получение аудиосообщения. Скачивает аудиофайл и предлагает выбрать задачу.
-    """
+# Обработчик текстовых сообщений
+@bot.message_handler(content_types=['text'])
+def message_reply(message):
+    # Ответ на текстовые сообщения
+    bot.send_message(message.chat.id, "Please, send an audio file.")
+
+
+# Обработчик аудио сообщений
+@bot.message_handler(content_types=['audio'])
+def work(message):
     try:
-        if update.message.audio is None:
-            update.message.reply_text("Пожалуйста, отправьте аудиофайл.")
-            return
-        audio_file = update.message.audio.get_file()
-        file_path = os.path.join("audio_files", f"{audio_file.file_id}.ogg")
-        audio_file.download(file_path)
-        update.message.reply_text(
-            "Выбери задачу:",
-            reply_markup=ReplyKeyboardMarkup(
-                task_keyboard, one_time_keyboard=True
-            ),
-        )
-    except Exception as e:
-        update.message.reply_text(f"Произошла ошибка: {str(e)}")
+        # Имя аудиофайла
+        file_name = message.audio.file_name
+        # Уведомление о получении файла
+        bot.send_message(message.chat.id, f"Working on \n<b>{file_name}</b>", parse_mode='HTML')
+
+        # Функция для получения результатов транскрибации
+        def get_results(config):
+            endpoint = "https://api.speechtext.ai/results?"  # Эндпоинт для проверки статуса задачи
+            while True:
+                results = requests.get(endpoint, params=config).json()
+                if "status" not in results:
+                    break
+                print("Task status: {}".format(results["status"]))
+                if results["status"] == 'failed':
+                    print("The task has failed: {}".format(results))
+                    break
+                if results["status"] == 'finished':
+                    break
+                time.sleep(1)
+            return results
+
+        # Загрузка аудиофайла в память
+        with open(file_name, mode="rb") as file:
+            post_body = file.read()
+
+        # Настройки задачи транскрибации
+        config = {
+            "key": secret_key,
+            "language": "en-US",
+            "punctuation": True,
+            "format": "m4a"
+        }
+
+        # Отправка запроса на транскрибацию аудио
+        r = requests.post("https://api.speechtext.ai/recognize?", headers={'Content-Type': "application/octet-stream"}, params=config, data=post_body).json()
+
+        # Получение ID задачи распознавания речи
+        task = r["id"]
+
+        # Получение результатов транскрибации
+        config = {
+            "key": secret_key,
+            "task": task,
+            "summary": True,
+            "summary_size": 15,
+            "highlights": True,
+            "max_keywords": 10
+        }
+
+        # Получение субтитров в формате SRT или VTT
+        config = {
+            "key": secret_key,
+            "task": task,
+            "output": "srt",
+            "max_caption_words": 15
+        }
+
+        subtitles = get_results(config)
+        bot.send_message(message.chat.id, subtitles.split('\n')[2])
+
+    except Exception:
+        bot.send_message(message.chat.id, "Something went wrong :(\nTry again.")
 
 
-# Обработчик выбора задачи
-def task_handler(update: Update, context: CallbackContext) -> None:
-    """
-    Обрабатывает выбор пользователя по выполнению задачи (транскрибация или перевод).
-    """
+# Обработчик голосовых сообщений
+@bot.message_handler(content_types=['voice'])
+def cluck(message):
     try:
-        task = update.message.text
-        if task == "Транскрибация":
-            transcribe_audio(update, context)
-        elif task == "Перевод":
-            update.message.reply_text("Введите целевой язык для перевода:")
-    except Exception as e:
-        update.message.reply_text(f"Произошла ошибка: {str(e)}")
+        file_info = bot.get_file(message.voice.file_id)
+        sausage = file_info.file_path
+        file_name = re.search(r'voice/(.*?).oga', sausage)
+        if file_name:
+            file_name = file_name.group(1)
+        else:
+            print("no file")
+        downloaded_file = bot.download_file(file_info.file_path)
+        with open(file_name, 'wb') as new_file:
+            new_file.write(downloaded_file)
+        bot.send_message(message.chat.id, f"Working on \n<b>your voice message</b>", parse_mode='HTML')
+
+        def get_results(config):
+            endpoint = "https://api.speechtext.ai/results?"
+            while True:
+                results = requests.get(endpoint, params=config).json()
+                if "status" not in results:
+                    break
+                print("Task status: {}".format(results["status"]))
+                if results["status"] == 'failed':
+                    print("The task has failed: {}".format(results))
+                    break
+                if results["status"] == 'finished':
+                    break
+                time.sleep(1)
+            return results
+
+        with open(file_name, mode="rb") as file:
+            post_body = file.read()
+
+        config = {
+            "key": secret_key,
+            "language": "en-US",
+            "punctuation": True,
+            "format": "m4a"
+        }
+
+        r = requests.post("https://api.speechtext.ai/recognize?", headers={'Content-Type': "application/octet-stream"}, params=config, data=post_body).json()
+
+        task = r["id"]
+
+        config = {
+            "key": secret_key,
+            "task": task,
+            "summary": True,
+            "summary_size": 15,
+            "highlights": True,
+            "max_keywords": 10
+        }
+
+        config = {
+            "key": secret_key,
+            "task": task,
+            "output": "srt",
+            "max_caption_words": 15
+        }
+
+        subtitles = get_results(config)
+        bot.send_message(message.chat.id, subtitles.split('\n')[2])
+
+    except Exception:
+        bot.send_message(message.chat.id, "Something went wrong :(\nTry again.")
 
 
-# Обработчик целевого языка для перевода
-def target_language_handler(update: Update, context: CallbackContext) -> None:
-    """
-    Обрабатывает выбор пользователем целевого языка для перевода.
-    """
-    try:
-        target_language = update.message.text
-        translate_audio(update, context, target_language)
-    except Exception as e:
-        update.message.reply_text(f"Произошла ошибка: {str(e)}")
-
-
-# Функция транскрибации аудиофайла
-def transcribe_audio(update: Update, context: CallbackContext) -> None:
-    """
-    Выполняет транскрибацию аудиофайла и отправляет результат пользователю.
-    """
-    try:
-        file_id = update.message.audio.file_id
-        file_path = os.path.join("audio_files", f"{file_id}.ogg")
-        segments, info = whisper_model.transcribe(file_path)
-
-        transcription = "\n".join([segment.text for segment in segments])
-        update.message.reply_text(f"Транскрибация аудиофайла:\n{transcription}")
-    except Exception as e:
-        update.message.reply_text(f"Произошла ошибка: {str(e)}")
-
-
-# Функция перевода транскрибированного текста
-def translate_audio(
-    update: Update, context: CallbackContext, target_language: str
-) -> None:
-    """
-    Выполняет перевод транскрибированного текста на указанный язык и отправляет результат пользователю.
-    """
-    try:
-        file_id = update.message.audio.file_id
-        file_path = os.path.join("audio_files", f"{file_id}.ogg")
-        segments, info = whisper_model.transcribe(file_path)
-
-        translations = []
-        for segment in segments:
-            translated_text = translate_segment(segment.text, target_language)
-            translations.append(translated_text)
-
-        translated_text = "\n".join(translations)
-        update.message.reply_text(
-            f"Перевод транскрибированного текста на {target_language}:\n{translated_text}"
-        )
-    except Exception as e:
-        update.message.reply_text(f"Произошла ошибка: {str(e)}")
-
-
-# Функция перевода сегмента текста на указанный язык
-def translate_segment(text: str, target_language: str) -> str:
-    """
-    Выполняет перевод сегмента текста на указанный язык с помощью модели.
-    """
-    src_lang = "eng_Latn"
-    tgt_lang = target_language
-
-    source_sentences = [text.strip()]
-    source_sentences_subworded = sp.encode_as_pieces(source_sentences)
-    source_sentences_subworded = [
-        [src_lang] + sent + ["</s>"] for sent in source_sentences_subworded
-    ]
-
-    translations_subworded = translator.translate_batch(
-        source_sentences_subworded,
-        batch_type="tokens",
-        max_batch_size=2024,
-        beam_size=5,
-        target_prefix=[[tgt_lang]],
-    )
-    translations_subworded = [
-        translation.hypotheses[0] for translation in translations_subworded
-    ]
-
-    translations = sp.decode(translations_subworded)
-    return translations
-
-
-# Обработчик неизвестной команды
-def unknown(update: Update, context: CallbackContext) -> None:
-    """
-    Обрабатывает неизвестные команды пользователя и отправляет уведомление о непонимании.
-    """
-    update.message.reply_text("Извините, я не понял ваш запрос.")
-
-
-# Функция для отправки помощи
-def help_command(update: Update, context: CallbackContext) -> None:
-    """
-    Отправляет информацию о том, как пользоваться ботом.
-    """
-    update.message.reply_text(
-        "Это бот для обработки аудиофайлов. Отправьте мне аудиосообщение и выберите задачу."
-    )
-
-
-# Функция для отправки информации о боте
-def info_command(update: Update, context: CallbackContext) -> None:
-    """
-    Отправляет информацию о боте.
-    """
-    update.message.reply_text(
-        "Этот бот обрабатывает аудиофайлы. Напишите /help для получения помощи."
-    )
-
-
-def main() -> None:
-    """
-    Основная функция, запускающая бота и настраивающая обработчики сообщений.
-    """
-    try:
-        updater = Updater(os.getenv("BOT_TOKEN"))
-        dispatcher = updater.dispatcher
-
-        dispatcher.add_handler(CommandHandler("start", start))
-        dispatcher.add_handler(CommandHandler("help", help_command))
-        dispatcher.add_handler(CommandHandler("info", info_command))
-        dispatcher.add_handler(
-            MessageHandler(Filters.audio & ~Filters.command, audio_handler)
-        )
-        dispatcher.add_handler(
-            MessageHandler(Filters.text & ~Filters.command, task_handler)
-        )
-        dispatcher.add_handler(
-            MessageHandler(
-                Filters.text & ~Filters.command & ~Filters.audio, target_language_handler
-            )
-        )
-        dispatcher.add_handler(MessageHandler(Filters.command, unknown))
-
-        updater.start_polling()
-        updater.idle()
-    except Exception as e:
-        print(f"Произошла ошибка: {str(e)}")
-
-
-if __name__ == "__main__":
-    main()
+# Запуск бота
+bot.infinity_polling()
