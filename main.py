@@ -4,7 +4,15 @@ from dotenv import load_dotenv
 import requests
 import time
 import re
+import logging
 
+
+# Настройка логирования
+logging.basicConfig(
+    filename="bot.log",
+    level=logging.ERROR,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -94,7 +102,10 @@ def work(message):
         subtitles = get_results(config)
         bot.send_message(message.chat.id, subtitles.split('\n')[2])
 
-    except Exception:
+    except Exception as e:
+        # Логирование ошибки
+        logging.error(f"Error processing audio file: {e}")
+        # Отправка сообщения об ошибке пользователю
         bot.send_message(message.chat.id, "Something went wrong :(\nTry again.")
 
 
@@ -162,7 +173,10 @@ def cluck(message):
         subtitles = get_results(config)
         bot.send_message(message.chat.id, subtitles.split('\n')[2])
 
-    except Exception:
+    except Exception as e:
+        # Логирование ошибки
+        logging.error(f"Error processing audio file: {e}")
+        # Отправка сообщения об ошибке пользователю
         bot.send_message(message.chat.id, "Something went wrong :(\nTry again.")
 
 
